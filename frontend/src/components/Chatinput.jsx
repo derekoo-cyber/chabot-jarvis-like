@@ -15,17 +15,22 @@ export default function ChatInput({ onSend, disabled }) {
   useEffect(() => {
     // Listen for AI replies sent via Socket.io
     socket.on('ai-reply', (data) => {
-      // data.reply is the text response
-      // data.user_text is what the AI thought you said
+      console.log('Received AI reply:', data);
+      
+      // IMPORTANT: First add the user's transcribed message
+      onSend(data.user_text, 'user');
+      
+      // Then add the AI's reply
       onSend(data.reply, 'assistant'); 
       
       // Automatically play the voice response
       const audio = new Audio(`http://localhost:5000/stream-voice?text=${encodeURIComponent(data.reply)}`);
-      audio.play();
+      audio.play().catch(err => console.error('Audio playback error:', err));
     });
 
     socket.on('ai-error', (data) => {
       console.error("AI Error:", data.error);
+      alert(`Voice input error: ${data.error}`);
       setIsRecording(false);
     });
 
@@ -46,27 +51,103 @@ export default function ChatInput({ onSend, disabled }) {
   const handleVoiceInput = async () => {
     if (isRecording) {
       // STOP RECORDING
-      mediaRecorderRef.current.stop();
+      console.log('Stopping recording...');
+      
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      
       setIsRecording(false);
+      
     } else {
       // START RECORDING
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        console.log('Starting recording...');
+        
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          } 
+        });
+        
+        // Try to use the best supported format
+        let mimeType = 'audio/webm';
+        const preferredTypes = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+          'audio/mp4'
+        ];
+        
+        for (const type of preferredTypes) {
+          if (MediaRecorder.isTypeSupported(type)) {
+            mimeType = type;
+            console.log('Using MIME type:', mimeType);
+            break;
+          }
+        }
+        
+        const recorder = new MediaRecorder(stream, { mimeType });
         mediaRecorderRef.current = recorder;
+
+        const audioChunks = [];
 
         recorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
-            // Send audio blob to Flask
-            socket.emit('stream-audio', event.data);
+            console.log(`Chunk received: ${event.data.size} bytes`);
+            audioChunks.push(event.data);
           }
         };
 
-        // Send a chunk every 2 seconds for processing
-        recorder.start(2000); 
+        recorder.onstop = async () => {
+          console.log('Recording stopped, processing audio...');
+          
+          // Combine all chunks into ONE complete blob
+          const completeAudioBlob = new Blob(audioChunks, { type: mimeType });
+          
+          console.log(`Complete audio size: ${completeAudioBlob.size} bytes`);
+          
+          // Validate audio size
+          if (completeAudioBlob.size < 1000) {
+            console.error('Audio too short:', completeAudioBlob.size, 'bytes');
+            alert('Recording too short. Please speak for at least 1 second.');
+            stream.getTracks().forEach(track => track.stop());
+            return;
+          }
+          
+          // Convert to ArrayBuffer
+          const arrayBuffer = await completeAudioBlob.arrayBuffer();
+          const bytes = new Uint8Array(arrayBuffer);
+          
+          console.log(`Sending ${bytes.length} bytes to server...`);
+          
+          // Send complete audio file
+          socket.emit('stream-audio', bytes);
+          
+          // Stop tracks to release microphone
+          stream.getTracks().forEach(track => {
+            track.stop();
+            console.log('Stopped track:', track.kind);
+          });
+        };
+
+        recorder.onerror = (event) => {
+          console.error('MediaRecorder error:', event.error);
+          alert('Recording error: ' + event.error.message);
+          setIsRecording(false);
+          stream.getTracks().forEach(track => track.stop());
+        };
+
+        // Start recording (don't specify interval - record continuously)
+        recorder.start();
         setIsRecording(true);
+        console.log('Recording started');
+        
       } catch (err) {
         console.error("Microphone access denied:", err);
+        alert('Microphone access denied. Please allow microphone access and try again.');
       }
     }
   };
